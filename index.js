@@ -1,36 +1,64 @@
 const { chromium } = require('playwright')
+const axios = require('axios');
 
 const HABITACION_NO_DISPONIBLE = "Habitación no disponible";
+const HABITACION_DISPONIBLE = "{hotel} - {habitacion} ({checkInDate} - {checkOutDate}) - {precio}€";
+const FILTRO_YEAR = 2022
+const FILTRO_MES = [12]
 
 const hoteles = [
     {
-        nombre: 'Petit Mirador - Suite de luxe',
-        url: 'https://direct-book.com/properties/petitmiradordirect?locale=es&currency=EUR&checkInDate={checkInDate}&checkOutDate={checkOutDate}',
-        checkPrecio: async ({ page }) => {
-            await page.waitForSelector('.content-box .room-type')
+        nombre: 'Petit Mirador',
+        url: 'https://direct-book.com/api/properties/petitmiradordirect/room-types/{habitacion}/availability?checkInsFrom={checkInDate}&checkInsTo={checkOutDate}&adults=2&children=0&infants=0&los=1',
+        useApi: true,
+        multipleDates: true,
+        typeFormatDate: "yyyymmdd",
+        habitaciones: [
+            {
+                id: "77491",
+                tipo: 'Suite de luxe',
+            },
+            {
+                id: "115430",
+                tipo: 'Suite magic',
+            }
+        ],
+        dataAvailable: (response) => {
+            return response.result.length > 0
+        },
+        getMessageIsAdailableAndPrice: async (response, hotel, habitacion) => {
+            const { result } = response
+            if (result.length > 0) {
+                let resultadosDisponibles = result.filter(x => x.totalAvailability > 0)
+                resultadosDisponibles.forEach(informacion => {
 
-            const content = await page.textContent('#roomType-77491 .room-rate-list span.price--now').catch(() => null);
-            if(content != null && content.includes('EUR') === true){
-                return content
-            }else return HABITACION_NO_DISPONIBLE
-        }
-    },
-    {
-        nombre: 'Petit Mirador - Suite magic',
-        url: 'https://direct-book.com/properties/petitmiradordirect?locale=es&currency=EUR&checkInDate={checkInDate}&checkOutDate={checkOutDate}',
-        checkPrecio: async ({ page }) => {
-            await page.waitForSelector('.content-box .room-type')
+                    let checkIn = new Date(informacion.date).toLocaleDateString();
+                    let fechaInicial = new Date(informacion.date)
+                    fechaInicial = fechaInicial.setDate(fechaInicial.getDate() + informacion.lengthOfStay)
+                    let checkOut = new Date(fechaInicial).toLocaleDateString()
 
-            const content = await page.textContent('#roomType-115430 .room-rate-list span.price--now').catch(() => null);
-            if(content != null && content.includes('EUR') === true){
-                return content
-            }else return HABITACION_NO_DISPONIBLE
+                    console.log("\x1b[32m", "Habitación disponible: ", "\x1b[0m", HABITACION_DISPONIBLE.format({
+                        hotel: hotel,
+                        habitacion: habitacion,
+                        checkInDate: checkIn,
+                        checkOutDate: checkOut,
+                        precio: informacion.price
+                    }))
+                });
+            } return false
         }
     },
     {
         nombre: 'Finca Prats - Junior Suite',
         url: 'https://fincaprats.com/index.php/es/reservar/hotel/1846?limit=10&limitstart=0&board=no&pack=&checkin={checkInDate}&checkout={checkOutDate}&rooms=1&adults%5B%5D=2',
-        checkPrecio: async ({ page }) => {
+        useApi: false,
+        multipleDates: false,
+        typeFormatDate: "yyyymmdd",
+        habitaciones: [],
+        dataAvailable: (response) => {
+            return true
+        },
+        getMessageIsAdailableAndPrice: async ({ page }) => {
             await page.waitForSelector('#hotel-products-rooms tbody')
 
             const regex = new RegExp(/(\d+\.?\d*)/g);
@@ -42,33 +70,107 @@ const hoteles = [
     }
 ]
 
-;(async () => {
-    const browser = await chromium.launch({ headless: true })
+    ; (async () => {
+        const browser = await chromium.launch({ headless: true })
 
-    for (const hotel of hoteles ) {
-        const { nombre, url, checkPrecio } = hotel
+        const fechasAComprobar = getFinDeSemana(FILTRO_YEAR, FILTRO_MES)
 
-        const page = await browser.newPage()
-        try {
-            await page.goto(url.format({ checkInDate: '11-12-2022', checkOutDate: '12-12-2022' }))
-            //await page.goto(url.format({ checkInDate: '24-10-2022', checkOutDate: '25-10-2022' }))
-            const precio = await checkPrecio({ page })
-            console.log(`${nombre}: ${precio}`)
-        } catch (error) {
-            console.log(`No ha sido posible acceder al hotel: ${nombre}`)
+        for (const hotel of hoteles) {
+            const { nombre, url, habitaciones, useApi, multipleDates, typeFormatDate, dataAvailable, getMessageIsAdailableAndPrice } = hotel
+
+            /* Si hay una API disponible y permite hacer filtrar entre dos fechas */
+            if (useApi && multipleDates) {
+                /* Si queremos mirar más de una habitación del mismo hotel aprovechamos los mismos datos del hotel, cambiando solo la información de la habitación */
+                for (const habitacion of habitaciones) {
+                    const { id, tipo } = habitacion
+
+                    const urlFormatted = getUrlFormatted(url, typeFormatDate, fechasAComprobar[0], fechasAComprobar[fechasAComprobar.length - 1], id)
+                    const response = await axios.get(urlFormatted)
+                    if (dataAvailable(response.data)) {
+                        getMessageIsAdailableAndPrice(response.data, nombre, tipo)
+                    }
+                }
+            } else {
+                for (const checkInDate of fechasAComprobar) {
+                    try {
+                        /* Establecemos las fechas a buscar */
+                        const checkOutDate = new Date(checkInDate);
+                        checkOutDate.setDate(checkOutDate.getDate() + 1);
+                        /* Si tenemos API disponible, hacemos petición HTTP, de lo contrario scraping con chromium */
+                        if (useApi && !multipleDates) {
+                            /* Si queremos mirar más de una habitación del mismo hotel aprovechamos los mismos datos del hotel, cambiando solo la información de la habitación */
+                            for (const habitacion of habitaciones) {
+                                const { id, tipo } = habitacion
+                                /* Mantenemos la constante url intacta para poder volver a formatear le url en la siguiente habitación */
+                                const urlFormatted = getUrlFormatted(url, typeFormatDate, checkInDate, checkOutDate, habitacion.id)
+                                const response = await axios.get(urlFormatted)
+                                if (dataAvailable(response.data)) {
+                                    getMessageIsAdailableAndPrice(response.data, nombre, tipo)
+                                }
+                            }
+                        } else {
+                            /* Abrimos una ventana nueva */
+                            const page = await browser.newPage()
+                            /* Formateamos la url */
+                            await page.goto(getUrlFormatted(url, typeFormatDate, checkInDate, checkInDate, ""))
+                            const precio = await getMessageIsAdailableAndPrice({ page })
+                            console.log(`${nombre}: ${checkInDate} - ${precio}`)
+                            page.close()
+                        }
+                    } catch (error) {
+                        console.log(`No ha sido posible acceder al hotel: ${nombre} para la fecha: ${checkInDate}`)
+                    }
+                }
+            }
+
         }
+
+        await browser.close()
+    })()
+
+function getFinDeSemana(year, months) {
+    const finesDeSemana = [];
+    months.forEach(monthElement => {
+        let month = monthElement - 1;
+        let fecha = new Date(year, month, 1);
+        while (fecha.getMonth() === month) {
+            if ((fecha.getDay() === 5 || fecha.getDay() === 6) && fecha > new Date()) {
+                finesDeSemana.push(new Date(fecha));
+            }
+            fecha.setDate(fecha.getDate() + 1);
+        }
+    });
+    return finesDeSemana;
+}
+
+function getUrlFormatted(url, typeFormatDate, checkInDate, checkOutDate, habitacion) {
+    checkInDate = getCorrectFormatDate(checkInDate, typeFormatDate)
+    checkOutDate = getCorrectFormatDate(checkOutDate, typeFormatDate)
+
+    return url.format({ habitacion: habitacion, checkInDate: checkInDate, checkOutDate: checkOutDate })
+}
+
+function getCorrectFormatDate(date, typeFormatDate) {
+    if (typeFormatDate === "yyyymmdd") {
+        return date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate()
     }
+}
 
-    await browser.close()
-    return true
-})()
+String.prototype.formatDate = function () {
+    var [day, month, year] = this.split('-');
+    return `${year}/${month}/${day}`;
+};
 
+String.prototype.dateFormatt = function () {
+    var [day, month, year] = this.split('/');
+    return `${day}-${month}-${year}`;
+};
 
-String.prototype.format = function(placeholders) {
+String.prototype.format = function (placeholders) {
     var s = this;
-    for(var propertyName in placeholders) {
+    for (var propertyName in placeholders) {
         var re = new RegExp('{' + propertyName + '}', 'gm');
         s = s.replace(re, placeholders[propertyName]);
-    }    
+    }
     return s;
 };
